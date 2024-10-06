@@ -884,46 +884,68 @@ In practice, the KV-cache is just a tuple ($$K\_cache$$, $$V\_cache$$), where ea
 
 <br>
 
-*Here is a pseudocode that demonstrates both the prefill and decoding phases using KV-caching and greedy search decoding for simplicity:*
+*Here is a code example to demonstrate how both the prefill and decoding phases of inference work when KV-caching is enabled - it uses greedy search decoding for simplicity:*
 
 
 
 ``` python
-def run_inference(model, tokenizer, prompt, max_new_tokens):
-    """
-    LLM inference dummy function for a single sample.
-    """
+def run_inference(model, tokenizer, prompt, max_length, use_kvcache=True):
     input_ids = tokenizer.encode(prompt, return_tensors='pt')
-    kvcache = (None, None)
-    model_output_ids = []
-    model.eval()
-
-    with torch.no_grad():
-        # Prefill phase: process the input prompt at once and populating the KV-cache
-        # until the first output token is generated
-        probabilites, kvcache = model(input_ids, kvcache=kvcache)
-        next_token = torch.argmax(probabilites, dim=-1) # select the most probable token
-        model_output_ids.append(next_token)
-
-        # Decoding phase: generating tokens one by one
-        model_output_ids.append(next_token)
-        inputs_ids = torch.cat(inputs_ids, next_token)
-
-        i = 0
-        while i < max_new_token:
-            probabilites, kvcache = model(input_ids, kvcache=kvcache)
-            next_token = torch.argmax(probabilites, dim=-1)
-            model_output_ids.append(next_token)
+    kv_cache = (None, None) if use_kvcache else None
+    outputs = []
+    i = 0
+    # prefill phase
+    logits, kv_cache = model(inputs_ids, kv_cache=kv_cache) 
+    next_token = torch.argmax(logits, dim=-1)
+    outputs.append(next_token)
+    
+    while i < max_length:
+        if use_kvcache:
+            # only the last input is forwarded to the model
+            logits, kv_cache = model(next_token, kv_cache=kv_cache) # update kv_cache	
+        else:
+            # pass the entire sequence (input prompt + generated tokens) to the model
+            inputs_ids = torch.cat((inputs_ids, next_token), dim=-1)
+            logits, _ = model(inputs_ids, kv_cache=kv_cache) 
+        
+        next_token = torch.argmax(logits, dim=-1)
+        outputs.append(next_token)
+        # stop if next_ids is eos token
+        if next_token.item() == tokenizer.eos_token_id:
+            break
+        i += 1
             
-            # stop if next_ids is eos token
-            if next_id == tokenizer.eos_token_id:
-                break
-                
-            # continue decoding & add generated token to input for the next step			
-            inputs_ids = torch.cat(inputs_ids, next_token)  # append prediction to input
-            i += 1
+    return tokenizer.decode(outputs)
+```
 
-    return tokenizer.decode(model_output_ids)
+Here is how the cache would be implemented inside the attention block : 
+
+``` python
+class Attention(nn.Module):
+    def attention(self, hidden_states, kv_cache=None, training=False):
+        """
+        When KV caching is enabled hidden_states correspond only to a single input 
+        token (which is the last generated token), when it's disabled
+        hidden_states correspond to (prompt + generated_tokens_so_far)
+        """
+        if not training and kv_cache is not None:
+            query, key, value = self.linear_projection(hidden_states)
+            cached_K, cached_V = kv_cache[0], kv_cache[1]
+            # update the cache 
+            K = torch.cat((cached_K, key), dim=-2) 
+            V = torch.cat((cached_V, value), dim=-2)
+            kv_cache = (K, V) 
+        else:
+            query, K, V = linear_projection(hidden_states)
+        
+        atten_scores = scaled_dot_product(query, K, V)
+        # we handle any post pocessing of attention scores here
+        # to make it ignore certain tokens during attention
+        probs = F.softmax(atten_scores)
+        attn_output = probs @ V	
+        return attn_output, kv_cache
+
+
 ```
 
 <br>
